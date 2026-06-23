@@ -105,10 +105,12 @@ def rate_for_business(business_hint):
 def cost_reveal_line(rate):
     annual = HOURS_LOST_PER_WEEK * rate * WORKING_WEEKS
     return (
-        f"Let's put a number on it: {HOURS_LOST_PER_WEEK} hours a week on admin "
-        f"is ~{HOURS_LOST_PER_WEEK * WORKING_WEEKS} hours a year. At a typical "
-        f"rate of £{rate}/hr for your trade, that's roughly £{annual:,} of "
-        f"billable time spent on paperwork instead of work every year."
+        f"Let's put a number on it: a 2026 survey of UK tradespeople found they "
+        f"lose an average of {HOURS_LOST_PER_WEEK} hours a week to admin — "
+        f"quoting, invoicing, chasing payments — that's "
+        f"~{HOURS_LOST_PER_WEEK * WORKING_WEEKS} hours a year. At a typical "
+        f"rate of £{rate}/hr for your trade, that's over £{annual:,} of work "
+        f"you could be taking on instead — bigger jobs, more customers, same hours."
     )
 
 
