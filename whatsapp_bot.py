@@ -1,34 +1,37 @@
 """
-LeadPing WhatsApp sales agent — Twilio webhook bot.
+LeadPing sales agent — web chat widget + Twilio WhatsApp webhook (legacy).
 
 Implements the qualifying-question -> cost-reveal -> book-a-call flow from
-method1_sms_whatsapp_playbook.md. Runs as a Flask app; Twilio POSTs each
-inbound WhatsApp message to /whatsapp, and this returns TwiML with the
-agent's reply (this is the standard Twilio "session reply" pattern — no
-separate outbound API call needed for replies within an active thread).
+method1_sms_whatsapp_playbook.md.
 
-Conversation state is kept in a local JSON file, keyed by phone number, so
-the bot remembers where each prospect is in the flow between messages
-(Flask requests are stateless otherwise).
+Primary channel (current): a web chat widget at GET /chat, backed by
+POST /api/chat. The SMS first-touch links here instead of to a wa.me
+WhatsApp link, so there's no Meta Business verification / WhatsApp opt-in
+policy involved at all — it's just a webpage.
+
+Legacy channel (kept, unused unless you wire it back up): POST /whatsapp
+for Twilio's WhatsApp webhook, in case you go back to the WhatsApp Business
+Platform route later.
+
+Conversation state is kept in a local JSON file, keyed by a session id (web
+chat) or phone number (WhatsApp), so the bot remembers where each prospect
+is in the flow between messages (Flask requests are stateless otherwise).
 
 SETUP REQUIRED BEFORE THIS WORKS:
 1. pip install flask twilio
-2. Run this app somewhere with a public HTTPS URL (see notes at bottom).
-3. In Twilio Console -> Messaging -> Senders -> WhatsApp senders -> your
-   +447378639124 sender -> set "When a message comes in" webhook to:
-       https://<your-public-url>/whatsapp   (method: HTTP POST)
-4. Fill in BOOKING_LINK and PHONE_TO_TRADE lookup below if you want the
-   cost-reveal to use the correct rate per business (falls back to a
-   generic rate if the phone number isn't matched).
+2. Run this app somewhere with a public HTTPS URL.
+3. Point the SMS first-touch link at https://<your-public-url>/chat?trade=...
+   instead of the wa.me link.
 """
 
 import json
 import logging
 import os
 import re
+import uuid
 from pathlib import Path
 
-from flask import Flask, request
+from flask import Flask, jsonify, request
 from twilio.twiml.messaging_response import MessagingResponse
 
 logging.basicConfig(
@@ -185,6 +188,114 @@ def handle_message(phone, body, trade_hint=None):
 
 
 app = Flask(__name__)
+
+
+CHAT_PAGE_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>West Midlands AI — Quick chat</title>
+<style>
+  body { margin:0; font-family: -apple-system, Segoe UI, Roboto, sans-serif; background:#f4f5f7; }
+  .wrap { max-width: 480px; margin: 0 auto; min-height: 100vh; display:flex; flex-direction:column; background:#fff; }
+  header { background:#1F3864; color:#fff; padding:16px 18px; font-weight:600; }
+  header span { display:block; font-weight:400; font-size:13px; opacity:.85; margin-top:2px; }
+  #messages { flex:1; padding:16px; overflow-y:auto; display:flex; flex-direction:column; gap:10px; }
+  .bubble { max-width:80%; padding:10px 14px; border-radius:14px; line-height:1.4; font-size:15px; white-space:pre-wrap; }
+  .bot { background:#eef0f4; color:#222; align-self:flex-start; border-bottom-left-radius:4px; }
+  .me { background:#1F3864; color:#fff; align-self:flex-end; border-bottom-right-radius:4px; }
+  form { display:flex; border-top:1px solid #e3e4e8; padding:10px; gap:8px; }
+  input { flex:1; border:1px solid #d8dadf; border-radius:20px; padding:10px 16px; font-size:15px; outline:none; }
+  button { background:#1F3864; color:#fff; border:none; border-radius:20px; padding:10px 18px; font-size:15px; cursor:pointer; }
+  button:disabled { opacity:.5; }
+  a { color:#1F3864; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>West Midlands AI<span>Quick 30-second chat</span></header>
+  <div id="messages"></div>
+  <form id="form">
+    <input id="input" autocomplete="off" placeholder="Type a message…" />
+    <button type="submit">Send</button>
+  </form>
+</div>
+<script>
+  const params = new URLSearchParams(window.location.search);
+  const trade = params.get('trade') || '';
+  let sessionId = localStorage.getItem('wmai_session_id');
+  if (!sessionId) {
+    sessionId = (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random());
+    localStorage.setItem('wmai_session_id', sessionId);
+  }
+
+  const messagesEl = document.getElementById('messages');
+  const formEl = document.getElementById('form');
+  const inputEl = document.getElementById('input');
+
+  function addBubble(text, who) {
+    const div = document.createElement('div');
+    div.className = 'bubble ' + who;
+    div.innerHTML = text.replace(/\\n/g, '<br>').replace(
+      /(https?:\\/\\/[^\\s]+)/g, '<a href="$1" target="_blank" rel="noopener">$1</a>'
+    );
+    messagesEl.appendChild(div);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+  }
+
+  async function send(message) {
+    const res = await fetch('/api/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: sessionId, message: message, trade: trade })
+    });
+    const data = await res.json();
+    addBubble(data.reply, 'bot');
+  }
+
+  formEl.addEventListener('submit', (e) => {
+    e.preventDefault();
+    const val = inputEl.value.trim();
+    if (!val) return;
+    addBubble(val, 'me');
+    inputEl.value = '';
+    send(val);
+  });
+
+  // Kick off the conversation automatically on load.
+  send('__start__');
+</script>
+</body>
+</html>
+"""
+
+
+@app.route("/chat", methods=["GET"])
+def chat_page():
+    return CHAT_PAGE_HTML
+
+
+@app.route("/api/chat", methods=["POST"])
+def api_chat():
+    data = request.get_json(force=True, silent=True) or {}
+    session_id = data.get("session_id") or str(uuid.uuid4())
+    message = data.get("message", "")
+    trade_hint = data.get("trade")
+
+    if message == "__start__":
+        # First load of the page — don't run it through classify_yes_no,
+        # just trigger the opening message for a brand-new session.
+        state = load_state()
+        if session_id in state:
+            # Returning visitor mid-flow — re-send their last bot reply
+            # is not tracked, so just nudge them to continue.
+            return jsonify({"reply": "Pick up where we left off — go ahead and reply to the last question."})
+        reply_text = handle_message(session_id, "", trade_hint=trade_hint)
+        return jsonify({"reply": reply_text})
+
+    reply_text = handle_message(session_id, message, trade_hint=trade_hint)
+    return jsonify({"reply": reply_text})
 
 
 @app.route("/whatsapp", methods=["POST"])
