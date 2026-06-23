@@ -66,8 +66,8 @@ TRADE_RATES = {
     "man-with-van": 60, "clearance": 60,
 }
 DEFAULT_RATE = 40
-HOURS_LOST_PER_WEEK = 3
-WORKING_WEEKS = 46
+HOURS_LOST_PER_WEEK = 8
+WORKING_WEEKS = 48
 
 YES_WORDS = {"yes", "y", "yeah", "yep", "yup", "correct", "true", "definitely", "sure"}
 NO_WORDS = {"no", "n", "nah", "nope", "not really", "false"}
