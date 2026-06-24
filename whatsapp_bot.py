@@ -122,9 +122,10 @@ def handle_message(phone, body, trade_hint=None):
 
     if stage == 0:
         reply = (
-            "Hey, thanks for reaching out! I'm Tom's assistant at West "
-            "Midlands AI. Mind if I ask 3 quick yes/no questions to see if "
-            "this is even relevant to you? Takes 30 seconds.\n\n"
+            "Hey, it's Tom's assistant at West Midlands AI. We help mechanics "
+            "spot exactly how much admin is costing them each year — most "
+            "have never worked it out. Want to see your number? Just 3 "
+            "quick questions, 30 seconds.\n\n"
             "Do you currently quote and invoice jobs manually — by hand, "
             "spreadsheet, call or texting back and forth — rather than with "
             "automatic software?"
