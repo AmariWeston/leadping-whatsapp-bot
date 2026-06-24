@@ -17,6 +17,12 @@ Conversation state is kept in a local JSON file, keyed by a session id (web
 chat) or phone number (WhatsApp), so the bot remembers where each prospect
 is in the flow between messages (Flask requests are stateless otherwise).
 
+Basic analytics (link clicks + chat completions) are logged to a local JSON
+file and viewable at GET /stats. Note: on Railway the filesystem typically
+resets on redeploy, so these numbers don't survive a `git push` — fine for
+short-term testing, but swap in a real DB (e.g. Railway Postgres) if you
+want numbers that persist across deploys.
+
 SETUP REQUIRED BEFORE THIS WORKS:
 1. pip install flask twilio
 2. Run this app somewhere with a public HTTPS URL.
@@ -29,6 +35,7 @@ import logging
 import os
 import re
 import uuid
+from datetime import datetime
 from pathlib import Path
 
 from flask import Flask, jsonify, request
@@ -45,6 +52,7 @@ logging.basicConfig(
 log = logging.getLogger("whatsapp_bot")
 
 STATE_FILE = Path("conversation_state.json")
+ANALYTICS_FILE = Path("analytics.json")
 BOOKING_LINK = "https://cal.eu/wm-ai/30min"
 
 # Representative UK hourly rates by trade keyword (sourced from Checkatrade/
@@ -81,6 +89,28 @@ def load_state():
 
 def save_state(state):
     STATE_FILE.write_text(json.dumps(state, indent=2))
+
+
+def log_event(event_type, session_id=None, trade=None):
+    """Append a simple analytics event (link click / chat completed) to
+    ANALYTICS_FILE. Best-effort — never let analytics break the bot."""
+    try:
+        record = {
+            "ts": datetime.utcnow().isoformat(),
+            "event": event_type,
+            "session_id": session_id,
+            "trade": trade,
+        }
+        data = []
+        if ANALYTICS_FILE.exists():
+            try:
+                data = json.loads(ANALYTICS_FILE.read_text())
+            except Exception:
+                data = []
+        data.append(record)
+        ANALYTICS_FILE.write_text(json.dumps(data, indent=2))
+    except Exception:
+        log.exception("Failed to log analytics event %s", event_type)
 
 
 def classify_yes_no(text):
@@ -186,6 +216,13 @@ def handle_message(phone, body, trade_hint=None):
 
     state[phone] = convo
     save_state(state)
+
+    if BOOKING_LINK in (reply or "") and not convo.get("_completion_logged"):
+        log_event("chat_completed", session_id=phone, trade=convo.get("trade_hint"))
+        convo["_completion_logged"] = True
+        state[phone] = convo
+        save_state(state)
+
     log.info("phone=%s stage=%s->%s body=%r reply=%r", phone, stage, convo["stage"], body, reply)
     return reply
 
@@ -276,6 +313,7 @@ CHAT_PAGE_HTML = """<!doctype html>
 
 @app.route("/chat", methods=["GET"])
 def chat_page():
+    log_event("link_click", trade=request.args.get("trade"))
     return CHAT_PAGE_HTML
 
 
@@ -312,6 +350,31 @@ def whatsapp_webhook():
     resp = MessagingResponse()
     resp.message(reply_text)
     return str(resp)
+
+
+@app.route("/stats", methods=["GET"])
+def stats():
+    if not ANALYTICS_FILE.exists():
+        return jsonify({"clicks": 0, "completions": 0, "by_trade": {}})
+    try:
+        data = json.loads(ANALYTICS_FILE.read_text())
+    except Exception:
+        data = []
+
+    by_trade = {}
+    for d in data:
+        t = d.get("trade") or "unknown"
+        by_trade.setdefault(t, {"clicks": 0, "completions": 0})
+        if d.get("event") == "link_click":
+            by_trade[t]["clicks"] += 1
+        elif d.get("event") == "chat_completed":
+            by_trade[t]["completions"] += 1
+
+    return jsonify({
+        "clicks": sum(v["clicks"] for v in by_trade.values()),
+        "completions": sum(v["completions"] for v in by_trade.values()),
+        "by_trade": by_trade,
+    })
 
 
 @app.route("/health", methods=["GET"])
