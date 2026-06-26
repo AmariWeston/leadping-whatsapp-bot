@@ -1,33 +1,35 @@
 """
-LeadPing sales agent — web chat widget + Twilio WhatsApp webhook (legacy).
+LeadPing sales agent — static one-pager landing page (web) + legacy Twilio
+WhatsApp webhook (unused).
 
-Implements the qualifying-question -> cost-reveal -> book-a-call flow from
-method1_sms_whatsapp_playbook.md.
+V2 of this bot. The original version ran an interactive yes/no chat at
+GET /chat -> POST /api/chat. Data showed 13 SMS link clicks, 0 chat
+completions — people clicked through but weren't willing to type back and
+forth with an unknown number/bot before seeing any payoff. This version
+drops the chat entirely: GET /chat now renders a static landing page that
+shows the trade-specific cost number immediately, explains the tool in
+plain language, and has a single "book a call" button. No typing required.
 
-Primary channel (current): a web chat widget at GET /chat, backed by
-POST /api/chat. The SMS first-touch links here instead of to a wa.me
-WhatsApp link, so there's no Meta Business verification / WhatsApp opt-in
-policy involved at all — it's just a webpage.
+Primary channel: GET /chat?trade=<keyword> — static landing page.
+CTA: GET /go?trade=<keyword> — logs a click-through event, then redirects
+to BOOKING_LINK. This is the new conversion metric (replaces "chat
+completed").
 
-Legacy channel (kept, unused unless you wire it back up): POST /whatsapp
-for Twilio's WhatsApp webhook, in case you go back to the WhatsApp Business
-Platform route later.
+Legacy (kept, unused unless wired back up): POST /whatsapp for Twilio's
+WhatsApp webhook, and POST /api/chat / the old conversational flow, in case
+you want to bring the chat back later. conversation_state.json /
+handle_message() are untouched from v1.
 
-Conversation state is kept in a local JSON file, keyed by a session id (web
-chat) or phone number (WhatsApp), so the bot remembers where each prospect
-is in the flow between messages (Flask requests are stateless otherwise).
-
-Basic analytics (link clicks + chat completions) are logged to a local JSON
-file and viewable at GET /stats. Note: on Railway the filesystem typically
-resets on redeploy, so these numbers don't survive a `git push` — fine for
-short-term testing, but swap in a real DB (e.g. Railway Postgres) if you
-want numbers that persist across deploys.
+Basic analytics (page views + CTA click-throughs) are logged to a local
+JSON file and viewable at GET /stats. Note: on Railway the filesystem
+typically resets on redeploy, so these numbers don't survive a `git push`
+— fine for short-term testing, but swap in a real DB (e.g. Railway
+Postgres) if you want numbers that persist across deploys.
 
 SETUP REQUIRED BEFORE THIS WORKS:
 1. pip install flask twilio
 2. Run this app somewhere with a public HTTPS URL.
 3. Point the SMS first-touch link at https://<your-public-url>/chat?trade=...
-   instead of the wa.me link.
 """
 
 import json
@@ -38,7 +40,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, redirect, request
 from twilio.twiml.messaging_response import MessagingResponse
 
 logging.basicConfig(
@@ -55,25 +57,28 @@ STATE_FILE = Path("conversation_state.json")
 ANALYTICS_FILE = Path("analytics.json")
 BOOKING_LINK = "https://cal.eu/wm-ai/30min"
 
-# Representative UK hourly rates by trade keyword (sourced from Checkatrade/
-# MyBuilder/Bark cost guides — see method1_sms_whatsapp_playbook.md for
-# sources). Used to personalise the cost-reveal line.
-TRADE_RATES = {
-    "mechanic": 45, "car repair": 45,
-    "plumber": 45,
-    "electrician": 50,
-    "locksmith": 55,
-    "gas": 55, "heating": 55,
-    "drainage": 45,
-    "domestic cleaning": 19, "cleaning": 19,
-    "gardening": 32, "landscaping": 32,
-    "window cleaning": 30,
-    "carpet": 22, "upholstery": 22, "end-of-tenancy": 22, "eot": 22,
-    "oven cleaning": 50,  # per-job trade; treated as flat-rate equivalent
-    "gutter cleaning": 25,
-    "man-with-van": 60, "clearance": 60,
+# Representative UK hourly rates + a friendly plural label, keyed by trade
+# keyword (sourced from Checkatrade/MyBuilder/Bark cost guides — see
+# method1_sms_whatsapp_playbook.md for sources). One dict so the rate and
+# label can never drift out of sync with each other.
+TRADE_INFO = {
+    "mechanic": (45, "mechanics"), "car repair": (45, "mechanics"),
+    "plumber": (45, "plumbers"),
+    "electrician": (50, "electricians"),
+    "locksmith": (55, "locksmiths"),
+    "gas": (55, "heating engineers"), "heating": (55, "heating engineers"),
+    "drainage": (45, "drainage engineers"),
+    "domestic cleaning": (19, "cleaners"), "cleaning": (19, "cleaners"),
+    "gardening": (32, "gardeners"), "landscaping": (32, "gardeners"),
+    "window cleaning": (30, "window cleaners"),
+    "carpet": (22, "carpet cleaners"), "upholstery": (22, "carpet cleaners"),
+    "end-of-tenancy": (22, "cleaners"), "eot": (22, "cleaners"),
+    "oven cleaning": (50, "oven cleaners"),
+    "gutter cleaning": (25, "gutter cleaners"),
+    "man-with-van": (60, "clearance firms"), "clearance": (60, "clearance firms"),
 }
 DEFAULT_RATE = 40
+DEFAULT_LABEL = "tradespeople"
 HOURS_LOST_PER_WEEK = 8
 WORKING_WEEKS = 48
 
@@ -92,7 +97,7 @@ def save_state(state):
 
 
 def log_event(event_type, session_id=None, trade=None):
-    """Append a simple analytics event (link click / chat completed) to
+    """Append a simple analytics event (page view / CTA click-through) to
     ANALYTICS_FILE. Best-effort — never let analytics break the bot."""
     try:
         record = {
@@ -122,14 +127,26 @@ def classify_yes_no(text):
     return None
 
 
-def rate_for_business(business_hint):
+def info_for_business(business_hint):
+    """Return (rate, label) for a trade hint, falling back to defaults.
+
+    Checks longer/more specific keywords first (e.g. "window cleaning"
+    before "cleaning") so a generic substring like "cleaning" can't shadow
+    a more specific match — "window cleaning" used to silently match the
+    generic "cleaning" entry (£19/hr) instead of its own £30/hr rate
+    because dict order put "cleaning" earlier than "window cleaning".
+    """
     if not business_hint:
-        return DEFAULT_RATE
+        return DEFAULT_RATE, DEFAULT_LABEL
     hint = business_hint.lower()
-    for keyword, rate in TRADE_RATES.items():
+    for keyword in sorted(TRADE_INFO, key=len, reverse=True):
         if keyword in hint:
-            return rate
-    return DEFAULT_RATE
+            return TRADE_INFO[keyword]
+    return DEFAULT_RATE, DEFAULT_LABEL
+
+
+def rate_for_business(business_hint):
+    return info_for_business(business_hint)[0]
 
 
 def cost_reveal_line(rate):
@@ -145,6 +162,8 @@ def cost_reveal_line(rate):
 
 
 def handle_message(phone, body, trade_hint=None):
+    """Legacy interactive flow — kept for /whatsapp and /api/chat, not used
+    by the default /chat landing page anymore. See module docstring."""
     state = load_state()
     convo = state.get(phone, {"stage": 0, "answers": {}, "trade_hint": trade_hint})
     stage = convo["stage"]
@@ -230,82 +249,55 @@ def handle_message(phone, body, trade_hint=None):
 app = Flask(__name__)
 
 
-CHAT_PAGE_HTML = """<!doctype html>
+def render_landing_page(trade_hint):
+    rate, label = info_for_business(trade_hint)
+    annual = HOURS_LOST_PER_WEEK * rate * WORKING_WEEKS
+    cta_href = f"/go?trade={trade_hint}" if trade_hint else "/go"
+
+    return f"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>West Midlands AI — Quick chat</title>
+<title>West Midlands AI — Stop losing money to paperwork</title>
 <style>
-  body { margin:0; font-family: -apple-system, Segoe UI, Roboto, sans-serif; background:#f4f5f7; }
-  .wrap { max-width: 480px; margin: 0 auto; min-height: 100vh; display:flex; flex-direction:column; background:#fff; }
-  header { background:#1F3864; color:#fff; padding:16px 18px; font-weight:600; }
-  header span { display:block; font-weight:400; font-size:13px; opacity:.85; margin-top:2px; }
-  #messages { flex:1; padding:16px; overflow-y:auto; display:flex; flex-direction:column; gap:10px; }
-  .bubble { max-width:80%; padding:10px 14px; border-radius:14px; line-height:1.4; font-size:15px; white-space:pre-wrap; }
-  .bot { background:#eef0f4; color:#222; align-self:flex-start; border-bottom-left-radius:4px; }
-  .me { background:#1F3864; color:#fff; align-self:flex-end; border-bottom-right-radius:4px; }
-  form { display:flex; border-top:1px solid #e3e4e8; padding:10px; gap:8px; }
-  input { flex:1; border:1px solid #d8dadf; border-radius:20px; padding:10px 16px; font-size:15px; outline:none; }
-  button { background:#1F3864; color:#fff; border:none; border-radius:20px; padding:10px 18px; font-size:15px; cursor:pointer; }
-  button:disabled { opacity:.5; }
-  a { color:#1F3864; }
+  body {{ margin:0; font-family: -apple-system, Segoe UI, Roboto, sans-serif; background:#f4f5f7; color:#1a1a1a; }}
+  .wrap {{ max-width: 560px; margin: 0 auto; background:#fff; min-height:100vh; }}
+  header {{ background:#1F3864; color:#fff; padding:16px 20px; font-weight:600; }}
+  .hero {{ padding:32px 24px 8px; }}
+  .hero h1 {{ font-size:26px; line-height:1.3; margin:0 0 14px; }}
+  .hero .cost {{ color:#c0392b; }}
+  .hero p {{ font-size:16px; line-height:1.55; color:#444; margin:0 0 8px; }}
+  .source {{ font-size:12px; color:#888; margin:14px 0 0; }}
+  .steps {{ padding:8px 24px 4px; }}
+  .steps h2 {{ font-size:18px; margin:24px 0 14px; }}
+  .step {{ display:flex; gap:14px; margin-bottom:16px; align-items:flex-start; }}
+  .step .num {{ flex:0 0 28px; height:28px; border-radius:50%; background:#1F3864; color:#fff; display:flex; align-items:center; justify-content:center; font-size:14px; font-weight:600; }}
+  .step p {{ margin:2px 0 0; font-size:15px; line-height:1.5; color:#333; }}
+  .cta-block {{ padding:20px 24px 36px; text-align:center; }}
+  .cta-block a.button {{ display:inline-block; background:#1F3864; color:#fff; text-decoration:none; font-size:17px; font-weight:600; padding:16px 28px; border-radius:10px; width:100%; box-sizing:border-box; }}
+  .cta-block .note {{ font-size:13px; color:#888; margin-top:10px; }}
 </style>
 </head>
 <body>
 <div class="wrap">
-  <header>West Midlands AI<span>Quick 30-second chat</span></header>
-  <div id="messages"></div>
-  <form id="form">
-    <input id="input" autocomplete="off" placeholder="Type a message…" />
-    <button type="submit">Send</button>
-  </form>
+  <header>West Midlands AI</header>
+  <div class="hero">
+    <h1>You could be losing <span class="cost">over £{annual:,} a year</span> to paperwork.</h1>
+    <p>A 2026 survey of UK tradespeople found {label} lose an average of {HOURS_LOST_PER_WEEK} hours a week to quoting, invoicing and chasing payments — that's ~{HOURS_LOST_PER_WEEK * WORKING_WEEKS} hours a year most have never put a number on.</p>
+    <p class="source">Source: UK Admin Drain Report 2026 (HeyBRB, reported by Electrical Times). Based on a typical rate of £{rate}/hr for your trade.</p>
+  </div>
+  <div class="steps">
+    <h2>How it works</h2>
+    <div class="step"><div class="num">1</div><p>A customer messages you on Checkatrade.</p></div>
+    <div class="step"><div class="num">2</div><p>Software sends the quote, books the job in your diary, and sends the invoice once it's marked done — automatically.</p></div>
+    <div class="step"><div class="num">3</div><p>You just turn up and do the work.</p></div>
+  </div>
+  <div class="cta-block">
+    <a class="button" href="{cta_href}">Book a free 30-min call</a>
+    <div class="note">No commitment — just a quick chat with Tom.</div>
+  </div>
 </div>
-<script>
-  const params = new URLSearchParams(window.location.search);
-  const trade = params.get('trade') || '';
-  let sessionId = localStorage.getItem('wmai_session_id');
-  if (!sessionId) {
-    sessionId = (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random());
-    localStorage.setItem('wmai_session_id', sessionId);
-  }
-
-  const messagesEl = document.getElementById('messages');
-  const formEl = document.getElementById('form');
-  const inputEl = document.getElementById('input');
-
-  function addBubble(text, who) {
-    const div = document.createElement('div');
-    div.className = 'bubble ' + who;
-    div.innerHTML = text.replace(/\\n/g, '<br>').replace(
-      /(https?:\\/\\/[^\\s]+)/g, '<a href="$1" target="_blank" rel="noopener">$1</a>'
-    );
-    messagesEl.appendChild(div);
-    messagesEl.scrollTop = messagesEl.scrollHeight;
-  }
-
-  async function send(message) {
-    const res = await fetch('/api/chat', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ session_id: sessionId, message: message, trade: trade })
-    });
-    const data = await res.json();
-    addBubble(data.reply, 'bot');
-  }
-
-  formEl.addEventListener('submit', (e) => {
-    e.preventDefault();
-    const val = inputEl.value.trim();
-    if (!val) return;
-    addBubble(val, 'me');
-    inputEl.value = '';
-    send(val);
-  });
-
-  // Kick off the conversation automatically on load.
-  send('__start__');
-</script>
 </body>
 </html>
 """
@@ -313,24 +305,30 @@ CHAT_PAGE_HTML = """<!doctype html>
 
 @app.route("/chat", methods=["GET"])
 def chat_page():
-    log_event("link_click", trade=request.args.get("trade"))
-    return CHAT_PAGE_HTML
+    trade_hint = request.args.get("trade")
+    log_event("page_view", trade=trade_hint)
+    return render_landing_page(trade_hint)
+
+
+@app.route("/go", methods=["GET"])
+def go():
+    trade_hint = request.args.get("trade")
+    log_event("cta_click", trade=trade_hint)
+    return redirect(BOOKING_LINK, code=302)
 
 
 @app.route("/api/chat", methods=["POST"])
 def api_chat():
+    """Legacy — kept in case you want to bring the interactive chat back.
+    Not linked to from the current landing page."""
     data = request.get_json(force=True, silent=True) or {}
     session_id = data.get("session_id") or str(uuid.uuid4())
     message = data.get("message", "")
     trade_hint = data.get("trade")
 
     if message == "__start__":
-        # First load of the page — don't run it through classify_yes_no,
-        # just trigger the opening message for a brand-new session.
         state = load_state()
         if session_id in state:
-            # Returning visitor mid-flow — re-send their last bot reply
-            # is not tracked, so just nudge them to continue.
             return jsonify({"reply": "Pick up where we left off — go ahead and reply to the last question."})
         reply_text = handle_message(session_id, "", trade_hint=trade_hint)
         return jsonify({"reply": reply_text})
@@ -355,7 +353,7 @@ def whatsapp_webhook():
 @app.route("/stats", methods=["GET"])
 def stats():
     if not ANALYTICS_FILE.exists():
-        return jsonify({"clicks": 0, "completions": 0, "by_trade": {}})
+        return jsonify({"page_views": 0, "cta_clicks": 0, "by_trade": {}})
     try:
         data = json.loads(ANALYTICS_FILE.read_text())
     except Exception:
@@ -364,15 +362,18 @@ def stats():
     by_trade = {}
     for d in data:
         t = d.get("trade") or "unknown"
-        by_trade.setdefault(t, {"clicks": 0, "completions": 0})
-        if d.get("event") == "link_click":
-            by_trade[t]["clicks"] += 1
-        elif d.get("event") == "chat_completed":
-            by_trade[t]["completions"] += 1
+        by_trade.setdefault(t, {"page_views": 0, "cta_clicks": 0})
+        event = d.get("event")
+        # Back-compat with v1 event names (link_click / chat_completed) in
+        # case analytics.json already has rows from before this rewrite.
+        if event in ("page_view", "link_click"):
+            by_trade[t]["page_views"] += 1
+        elif event in ("cta_click", "chat_completed"):
+            by_trade[t]["cta_clicks"] += 1
 
     return jsonify({
-        "clicks": sum(v["clicks"] for v in by_trade.values()),
-        "completions": sum(v["completions"] for v in by_trade.values()),
+        "page_views": sum(v["page_views"] for v in by_trade.values()),
+        "cta_clicks": sum(v["cta_clicks"] for v in by_trade.values()),
         "by_trade": by_trade,
     })
 
