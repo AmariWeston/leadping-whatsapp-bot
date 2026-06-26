@@ -289,8 +289,8 @@ def render_landing_page(trade_hint):
   </div>
   <div class="steps">
     <h2>How it works</h2>
-    <div class="step"><div class="num">1</div><p>A customer messages you on Checkatrade.</p></div>
-    <div class="step"><div class="num">2</div><p>Software sends the quote, books the job in your diary, and sends the invoice once it's marked done — automatically.</p></div>
+    <div class="step"><div class="num">1</div><p>New customer lead apoears on Checkatrade.</p></div>
+    <div class="step"><div class="num">2</div><p>AI sends the quote, books the job in your diary, and sends the invoice once it's marked done — automatically.</p></div>
     <div class="step"><div class="num">3</div><p>You just turn up and do the work.</p></div>
   </div>
   <div class="cta-block">
